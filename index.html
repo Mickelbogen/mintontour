@@ -626,10 +626,19 @@ function parseXlsx(bytes) {
     headers.forEach((h, j) => obj[h] = r[j] !== undefined ? r[j] : "");
     if (!String(obj.name || "").trim()) continue;  // skip empty rows
     // Normalize types
-    if (obj.lat) obj.lat = parseFloat(String(obj.lat).replace(",", "."));
-    if (obj.lon) obj.lon = parseFloat(String(obj.lon).replace(",", "."));
-    if (isNaN(obj.lat)) obj.lat = null;
-    if (isNaN(obj.lon)) obj.lon = null;
+    // Parse lat/lon robustly (Excel may give us empty strings, numbers, or strings)
+    obj.lat = (() => {
+      const raw = obj.lat;
+      if (raw == null || raw === "") return null;
+      const v = parseFloat(String(raw).replace(",", "."));
+      return isNaN(v) ? null : v;
+    })();
+    obj.lon = (() => {
+      const raw = obj.lon;
+      if (raw == null || raw === "") return null;
+      const v = parseFloat(String(raw).replace(",", "."));
+      return isNaN(v) ? null : v;
+    })();
     // Normalize Quelle (drives color)
     obj.quelle = String(obj.quelle || "").trim().toLowerCase();
     const QUELLE_VALID = ["loi", "partner ur", "vorschlag lk kelheim", "eigene"];
@@ -673,8 +682,14 @@ function schoolsToXlsxBytes(schools, baseBytes) {
   const aoa = [origHeaders];
   schools.forEach(s => {
     aoa.push(headerKeys.map(k => {
-      if (k === "lat") return s.lat != null ? Number(s.lat.toFixed(6)) : "";
-      if (k === "lon") return s.lon != null ? Number(s.lon.toFixed(6)) : "";
+      if (k === "lat") {
+        const v = s.lat != null ? parseFloat(s.lat) : NaN;
+        return isNaN(v) ? "" : Number(v.toFixed(6));
+      }
+      if (k === "lon") {
+        const v = s.lon != null ? parseFloat(s.lon) : NaN;
+        return isNaN(v) ? "" : Number(v.toFixed(6));
+      }
       if (k === "quelle") return s.quelle ? quelleLabel(s.quelle) : "";
       if (k === "status") return s.status ? statusLabel(s.status) : "";
       if (k === "loi") return s.quelle === "loi" ? "✓" : "";
