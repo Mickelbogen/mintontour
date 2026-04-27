@@ -707,20 +707,50 @@ function schoolsToXlsxBytes(schools, baseBytes) {
 // ==========================================================
 // GEOCODING (Nominatim)
 // ==========================================================
+// Two geocoders for redundancy.
+// Photon (komoot.io) is browser-friendly (no User-Agent restrictions, generous CORS).
+// Nominatim is fallback - works but stricter.
 async function geocodeOne(q) {
-  // Clean the query: remove newlines, double spaces, leading/trailing whitespace
   q = String(q || "").replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").trim();
   if (!q) return null;
-  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=1&countrycodes=de`;
-  const resp = await fetch(url, { headers: { "User-Agent": "MINT.on.ToUR-Karte/1.0" } });
-  if (!resp.ok) throw new Error(`Nominatim: ${resp.status}`);
-  const arr = await resp.json();
-  if (!arr || !arr.length) return null;
-  const lat = parseFloat(arr[0].lat);
-  const lon = parseFloat(arr[0].lon);
-  // Sanity: must be in southern Germany (Bavaria + neighbors)
-  if (!(lat > 47.0 && lat < 51.0 && lon > 8.5 && lon < 14.5)) return null;
-  return { lat, lon };
+
+  // === Try Photon first ===
+  try {
+    const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=1&lang=de`;
+    const resp = await fetch(url);
+    if (resp.ok) {
+      const json = await resp.json();
+      if (json.features && json.features.length) {
+        const f = json.features[0];
+        const lon = f.geometry.coordinates[0];
+        const lat = f.geometry.coordinates[1];
+        const cc = f.properties && f.properties.countrycode;
+        if ((cc === "DE" || !cc) && lat > 47.0 && lat < 51.0 && lon > 8.5 && lon < 14.5) {
+          return { lat, lon, source: "photon" };
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("Photon failed:", e);
+  }
+
+  // === Fallback: Nominatim ===
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=1&countrycodes=de`;
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`Nominatim: ${resp.status}`);
+    const arr = await resp.json();
+    if (arr && arr.length) {
+      const lat = parseFloat(arr[0].lat);
+      const lon = parseFloat(arr[0].lon);
+      if (lat > 47.0 && lat < 51.0 && lon > 8.5 && lon < 14.5) {
+        return { lat, lon, source: "nominatim" };
+      }
+    }
+  } catch (e) {
+    console.warn("Nominatim failed:", e);
+  }
+  return null;
 }
 
 async function geocodeMissing(schools, onProgress) {
@@ -735,26 +765,28 @@ async function geocodeMissing(schools, onProgress) {
     if (s.strasse && s.ort) {
       const q1 = `${s.strasse}, ${s.plz || ""} ${s.ort}`;
       try { found = await geocodeOne(q1); } catch (e) { console.warn("Geocode strategy 1 failed:", e); }
-      await new Promise(r => setTimeout(r, 1100));
+      await new Promise(r => setTimeout(r, 300));
     }
-    // Strategy 2: school name + ort (fallback if no address or address didn't work)
+    // Strategy 2: school name + ort
     if (!found && s.name && s.ort) {
       const q2 = `${s.name}, ${s.ort}`;
       try { found = await geocodeOne(q2); } catch (e) { console.warn("Geocode strategy 2 failed:", e); }
-      await new Promise(r => setTimeout(r, 1100));
+      await new Promise(r => setTimeout(r, 300));
     }
-    // Strategy 3: just street + ort (without PLZ which sometimes confuses Nominatim)
+    // Strategy 3: street + ort without PLZ
     if (!found && s.strasse && s.ort) {
       const q3 = `${s.strasse}, ${s.ort}`;
       try { found = await geocodeOne(q3); } catch (e) { console.warn("Geocode strategy 3 failed:", e); }
-      await new Promise(r => setTimeout(r, 1100));
+      await new Promise(r => setTimeout(r, 300));
     }
     if (found) {
       s.lat = found.lat;
       s.lon = found.lon;
+      console.log(`✓ ${s.name} → ${found.lat.toFixed(4)}, ${found.lon.toFixed(4)} (${found.source})`);
     } else {
       failed++;
       failedList.push(s.name);
+      console.warn(`✗ ${s.name} – kein Treffer`);
     }
     done++;
   }
