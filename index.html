@@ -260,6 +260,7 @@
       <div class="form-section" style="margin-top:20px">
         <label>3. Änderungen speichern</label>
         <div id="stagedInfo" style="font-size:12px;color:var(--c-ink-2);margin-bottom:6px">Keine Änderungen geladen.</div>
+        <div id="failedGeocodeList" style="display:none; font-size:12px; padding:10px; background:#fef3c7; border-left:3px solid var(--c-warn); border-radius:4px; margin-bottom:8px"></div>
         <button class="btn btn-primary btn-full" id="btn-push-xlsx" disabled>↑ Verschlüsselt auf GitHub speichern</button>
         <div class="hint">Die verschlüsselte Excel wird als <code>schulen.xlsx.enc</code> ins Repo committet. Andere Team-Mitglieder sehen sie beim nächsten Laden.</div>
       </div>
@@ -707,39 +708,58 @@ function schoolsToXlsxBytes(schools, baseBytes) {
 // GEOCODING (Nominatim)
 // ==========================================================
 async function geocodeOne(q) {
+  // Clean the query: remove newlines, double spaces, leading/trailing whitespace
+  q = String(q || "").replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").trim();
+  if (!q) return null;
   const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=1&countrycodes=de`;
   const resp = await fetch(url, { headers: { "User-Agent": "MINT.on.ToUR-Karte/1.0" } });
   if (!resp.ok) throw new Error(`Nominatim: ${resp.status}`);
   const arr = await resp.json();
   if (!arr || !arr.length) return null;
-  return { lat: parseFloat(arr[0].lat), lon: parseFloat(arr[0].lon) };
+  const lat = parseFloat(arr[0].lat);
+  const lon = parseFloat(arr[0].lon);
+  // Sanity: must be in southern Germany (Bavaria + neighbors)
+  if (!(lat > 47.0 && lat < 51.0 && lon > 8.5 && lon < 14.5)) return null;
+  return { lat, lon };
 }
 
 async function geocodeMissing(schools, onProgress) {
-  const needs = schools.map((s, i) => ({ s, i })).filter(x => (x.s.lat == null || x.s.lon == null) && x.s.strasse && x.s.ort);
-  if (!needs.length) return { updated: 0, failed: 0 };
+  const needs = schools.map((s, i) => ({ s, i })).filter(x => (x.s.lat == null || x.s.lon == null) && (x.s.strasse || x.s.name) && x.s.ort);
+  if (!needs.length) return { updated: 0, failed: 0, failedList: [] };
   let done = 0, failed = 0;
+  const failedList = [];
   for (const { s, i } of needs) {
-    const q = `${s.strasse}, ${s.plz || ""} ${s.ort}`.trim();
-    try {
-      onProgress(done, needs.length, `${s.name}`);
-      const r = await geocodeOne(q);
-      if (r) {
-        s.lat = r.lat;
-        s.lon = r.lon;
-      } else {
-        failed++;
-      }
-    } catch (e) {
-      console.error("Geocode fail for", s.name, e);
+    onProgress(done, needs.length, s.name);
+    let found = null;
+    // Strategy 1: full address
+    if (s.strasse && s.ort) {
+      const q1 = `${s.strasse}, ${s.plz || ""} ${s.ort}`;
+      try { found = await geocodeOne(q1); } catch (e) { console.warn("Geocode strategy 1 failed:", e); }
+      await new Promise(r => setTimeout(r, 1100));
+    }
+    // Strategy 2: school name + ort (fallback if no address or address didn't work)
+    if (!found && s.name && s.ort) {
+      const q2 = `${s.name}, ${s.ort}`;
+      try { found = await geocodeOne(q2); } catch (e) { console.warn("Geocode strategy 2 failed:", e); }
+      await new Promise(r => setTimeout(r, 1100));
+    }
+    // Strategy 3: just street + ort (without PLZ which sometimes confuses Nominatim)
+    if (!found && s.strasse && s.ort) {
+      const q3 = `${s.strasse}, ${s.ort}`;
+      try { found = await geocodeOne(q3); } catch (e) { console.warn("Geocode strategy 3 failed:", e); }
+      await new Promise(r => setTimeout(r, 1100));
+    }
+    if (found) {
+      s.lat = found.lat;
+      s.lon = found.lon;
+    } else {
       failed++;
+      failedList.push(s.name);
     }
     done++;
-    // Respect Nominatim rate limit (1 req/s)
-    await new Promise(r => setTimeout(r, 1100));
   }
   onProgress(done, needs.length, "Fertig");
-  return { updated: done - failed, failed };
+  return { updated: done - failed, failed, failedList };
 }
 
 // ==========================================================
@@ -1107,29 +1127,43 @@ async function handleXlsxUpload(file) {
   try {
     const buf = await file.arrayBuffer();
     const bytes = new Uint8Array(buf);
-    // Parse and check
     const schools = parseXlsx(bytes);
     if (!schools.length) { toast("Keine Schulen in der Datei gefunden (Sheet 'Schulen'?)", "err"); return; }
-    // Geocode missing
-    const needs = schools.filter(s => (s.lat == null || s.lon == null) && s.strasse && s.ort);
+    const needs = schools.filter(s => (s.lat == null || s.lon == null) && (s.strasse || s.name) && s.ort);
+    let geocodeResult = { updated: 0, failed: 0, failedList: [] };
     if (needs.length > 0) {
       showProgress("Geocodiere Adressen via OpenStreetMap…");
-      await geocodeMissing(schools, (done, total, name) => {
+      geocodeResult = await geocodeMissing(schools, (done, total, name) => {
         document.getElementById("progressFill").style.width = `${Math.round(done/total*100)}%`;
         document.getElementById("progressText").textContent = `${done} / ${total}  ·  ${name || ""}`;
       });
       hideProgress();
     }
-    // Rebuild xlsx bytes with filled coords
     const newBytes = schoolsToXlsxBytes(schools, bytes);
     state.schools = schools;
     state.stagedXlsxBytes = newBytes;
-    state.xlsxBytes = newBytes;  // also update current for download
+    state.xlsxBytes = newBytes;
     renderSchoolMarkers();
     renderSchoolList();
     renderSpkList();
+
+    // Show failed list in UI if any
+    const failBox = document.getElementById("failedGeocodeList");
+    if (geocodeResult.failedList && geocodeResult.failedList.length > 0) {
+      failBox.style.display = "block";
+      failBox.innerHTML = `<strong>⚠️ ${geocodeResult.failedList.length} Schule(n) ohne Position:</strong><br>` +
+        geocodeResult.failedList.map(n => `• ${n}`).join("<br>") +
+        `<br><br><em>Diese Schulen erscheinen NICHT auf der Karte. Bitte in Excel manuell Lat/Lon eintragen (Google Maps → Rechtsklick → Koordinaten kopieren) und neu hochladen.</em>`;
+    } else {
+      failBox.style.display = "none";
+    }
+
     updateSyncStatus();
-    toast(`✓ ${schools.length} Schulen geladen${needs.length ? `, ${needs.length} geocodiert` : ""}. Jetzt speichern nicht vergessen!`);
+    const msg = `✓ ${schools.length} Schulen geladen` +
+                (needs.length ? `, ${geocodeResult.updated}/${needs.length} geocodiert` : "") +
+                (geocodeResult.failed ? ` (${geocodeResult.failed} ohne Position!)` : "") +
+                ". Jetzt speichern!";
+    toast(msg, geocodeResult.failed ? "warn" : "");
   } catch (e) {
     hideProgress();
     console.error(e);
